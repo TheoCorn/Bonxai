@@ -9,15 +9,34 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <sstream>
+#include <stdexcept>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+#define X_COORD 0
+#define Y_COORD 1
+#define Z_COORD 2
 
 namespace Bonxai
 {
@@ -35,14 +54,19 @@ PointOut ConvertPoint(const PointIn& v);
 
 struct Point3D
 {
-  double x;
-  double y;
-  double z;
+  double coordinates[3];
+  // double x;
+  // double y;
+  // double z;
 
   Point3D() = default;
 
   Point3D(const Point3D& v) = default;
   Point3D(Point3D&& v) = default;
+
+  [[nodiscard]] inline int32_t x() const  {return coordinates[X_COORD];}
+  [[nodiscard]] inline int32_t y() const {return coordinates[Y_COORD];}
+  [[nodiscard]] inline int32_t z() const {return coordinates[Z_COORD];}
 
   Point3D& operator=(const Point3D& v) = default;
   Point3D& operator=(Point3D&& v) = default;
@@ -68,9 +92,14 @@ struct Point3D
 
 struct CoordT
 {
-  int32_t x;
-  int32_t y;
-  int32_t z;
+  // int32_t x;
+  // int32_t y;
+  // int32_t z;
+    int32_t coordinates[3];
+
+  [[nodiscard]] inline int32_t x() const  {return coordinates[X_COORD];}
+  [[nodiscard]] inline int32_t y() const {return coordinates[Y_COORD];}
+  [[nodiscard]] inline int32_t z() const {return coordinates[Z_COORD];}
 
   // Access to x, y, z, using index 0, 1, 2
   [[nodiscard]] int32_t& operator[](size_t index);
@@ -87,16 +116,16 @@ struct CoordT
 
 [[nodiscard]] inline CoordT PosToCoord(const Point3D& point, double inv_resolution)
 {
-  return { int32_t(point.x * inv_resolution) - std::signbit(point.x),
-           int32_t(point.y * inv_resolution) - std::signbit(point.y),
-           int32_t(point.z * inv_resolution) - std::signbit(point.z) };
+  return { int32_t(point.x() * inv_resolution) - std::signbit(point.x()),
+           int32_t(point.y() * inv_resolution) - std::signbit(point.y()),
+           int32_t(point.z() * inv_resolution) - std::signbit(point.z()) };
 }
 
 [[nodiscard]] inline Point3D CoordToPos(const CoordT& coord, double resolution)
 {
-  return { (double(coord.x) + 0.5) * resolution,
-           (double(coord.y) + 0.5) * resolution,
-           (double(coord.z) + 0.5) * resolution };
+  return { (double(coord.x()) + 0.5) * resolution,
+           (double(coord.y()) + 0.5) * resolution,
+           (double(coord.z()) + 0.5) * resolution };
 }
 
 //----------------------------------------------------------
@@ -217,7 +246,7 @@ private:
  * For instance, given Grid(3),
  * DIM will be 8 and SIZE 512 (8³)
  */
-template <typename DataT>
+template<typename DataT, template<typename GDataT> class GridAllocator>
 class Grid
 {
 private:
@@ -225,16 +254,17 @@ private:
   // total number of elements in the cube
   uint32_t size_;
 
-  DataT* data_ = nullptr;
   Bonxai::Mask mask_;
 
 public:
-  Grid(size_t log2dim)
+  DataT* data_ = nullptr;
+  Grid(size_t log2dim, GridAllocator<DataT>& gallocator)
     : dim_(1 << log2dim)
     , size_(dim_ * dim_ * dim_)
     , mask_(log2dim)
   {
-    data_ = new DataT[size_];
+    data_ = gallocator.gridMalloc(size_);
+    // data_ = new DataT[size_];
   }
 
   Grid(const Grid& other) = delete;
@@ -258,8 +288,190 @@ public:
   [[nodiscard]] const DataT& cell(size_t index) const { return data_[index]; };
 };
 
-//----------------------------------------------------------
+
+/**
+  unmap -- on mumap error
+  bad-pointer -- the arena has no page with this pointer in it
+*/
+enum class GAAFreeFailedReason {unmap, bad_ptr};
+class GAAFreeFailed : public std::exception {
+public:
+   void* ptr;
+   size_t len;
+   GAAFreeFailedReason reason;
+   char* str = new char[150];
+
+  GAAFreeFailed(void* ptr_, size_t len_, GAAFreeFailedReason reason_) : ptr(ptr_), len(len_), reason(reason_) {
+      switch (reason) {
+        case GAAFreeFailedReason::unmap:
+        sprintf(str, "umap failed for ptr %p (len: %zu)", ptr, len);
+        break;
+        case GAAFreeFailedReason::bad_ptr:
+        sprintf(str, "ptr %p of len (%zu) is not allocated by GAA", ptr, len);
+        break;
+      }
+  }
+
+    const char* what() const noexcept {
+      return str;
+    }
+      
+};
+
+struct GAAPageinfo {
+  void* ptr;
+  /// number of bytes in page
+  size_t page_size;
+  /// number of bytes used
+  size_t used;
+  /// number of Grids using this page
+  uint32_t num_references;  
+};
+
+
+template<typename DataT>
+class GridGeneralAllocator {
+  DataT* gridMalloc(size_t numElems);  
+  void gridFree(Grid<DataT>& grid);
+  void gridFree(DataT* ptr, size_t len);
+};
+
+
+template<typename DataT>
+DataT* GridGeneralAllocator<DataT>::gridMalloc(size_t num) {
+ return new DataT[num];   
+}
+
+template<typename DataT>
+void GridGeneralAllocator<DataT>::gridFree(Grid<DataT>& grid) {
+ delete [] grid.data_;   
+}
+
+template<typename DataT>
+void GridGeneralAllocator<DataT>::gridFree(DataT* ptr, size_t len) {
+  delete [] ptr;
+}
+
+#define GAA_PAGE_SIZE_DEFAULT 2048
+    
 template <typename DataT>
+class GridArenaAllocator {
+    // ptr, size of block, remaining in use
+  // std::vector<std::tuple<void*, size_t, uint32_t>> pages;
+  std::vector<GAAPageinfo> pages = std::vector<GAAPageinfo>();
+    // indexing from 1???
+  size_t last_nonfull = 0;
+
+  /// @throws GAAAllocFailiure
+  void addPage();
+  /// @throws GAAAllocFailiure
+  void addPage(size_t page_size);
+
+ public:
+  size_t new_page_size;
+
+  GridArenaAllocator() : new_page_size(GAA_PAGE_SIZE_DEFAULT) {}
+  /// size in bytes
+  GridArenaAllocator(size_t initial_size, size_t new_page_size_);
+  
+  DataT* gridMalloc(size_t numElems);  
+  void gridFree(Grid<DataT>& grid);
+  void gridFree(DataT* ptr, size_t len);
+
+  void freeAll();
+};
+
+template <typename DataT>
+void GridArenaAllocator<DataT>::addPage(size_t page_size) {
+
+  void* ptr = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);  
+  if (ptr == MAP_FAILED) {
+    throw std::bad_alloc();   
+  }
+
+  pages.emplace_back(GAAPageinfo{ ptr, page_size, 0, 0});
+}
+
+template <typename DataT>
+void GridArenaAllocator<DataT>::addPage() {
+  addPage(new_page_size);
+}
+
+template <typename DataT>
+GridArenaAllocator<DataT>::GridArenaAllocator(size_t initial_size, size_t new_page_size_) {
+  new_page_size = new_page_size_;
+  addPage(initial_size);
+}
+
+template<typename DataT>
+void GridArenaAllocator<DataT>::gridFree(Grid<DataT>& grid) {
+    gridFree(grid.data_, grid.size());
+}
+
+
+template<typename DataT>
+void GridArenaAllocator<DataT>::gridFree(DataT* ptr, size_t len) {
+  std::vector<GAAPageinfo>::iterator page = std::find_if(
+      pages.begin(), pages.end(), 
+      [&ptr](GAAPageinfo& page) {
+        return ptr >= page.ptr && reinterpret_cast<uint8_t*>(ptr) < reinterpret_cast<uint8_t*>(page.ptr) + page.page_size;
+      }
+  );
+  if (page == pages.end()) {
+    throw GAAFreeFailed(ptr, -1ULL, GAAFreeFailedReason::bad_ptr);
+  }
+
+  page->num_references -= 1;
+  // page->used -= len * sizeof(DataT);
+  if (page->num_references == 0) {
+        if (munmap(page->ptr, page->page_size) < 0) {
+          throw GAAFreeFailed(page->ptr, page->page_size, GAAFreeFailedReason::unmap);
+        }
+
+        if (--pages.end() != page) {
+          last_nonfull -= 1;
+        }
+        pages.erase(page);
+    }
+
+}  
+
+// template <typename DataT> 
+// void GridArenaAllocator<DataT>::gridFree(DataT* ptr) {
+      
+// }
+
+template <typename DataT> 
+void GridArenaAllocator<DataT>::freeAll() {
+  for (GAAPageinfo& page : pages) {
+      if (munmap(page.ptr, page.page_size) < 0) {
+        throw GAAFreeFailed(page.ptr, page.page_size, GAAFreeFailedReason::unmap);
+      }
+  }
+}
+
+template <typename DataT> 
+DataT* GridArenaAllocator<DataT>::gridMalloc(size_t numElems) {
+  if (last_nonfull == pages.size()) {
+    addPage();
+  }  
+
+  GAAPageinfo& page = pages[last_nonfull];   
+  size_t new_block_size = numElems * sizeof(DataT);
+  if (page.page_size - page.used < new_block_size) {
+    addPage();
+    last_nonfull++;    
+    page = pages.back();
+  }
+
+  uint8_t* start = static_cast<uint8_t*>(page.ptr) + page.used + 1;
+  page.used += new_block_size;
+
+  return reinterpret_cast<DataT*>(start);
+}
+
+//----------------------------------------------------------
+template <typename DataT, class GridAllocator>
 class VoxelGrid
 {
 public:
@@ -270,6 +482,8 @@ public:
   const double inv_resolution;
   const uint32_t INNER_MASK;
   const uint32_t LEAF_MASK;
+
+  const GridAllocator gallocator;
 
   using LeafGrid = Grid<DataT>;
   using InnerGrid = Grid<std::shared_ptr<LeafGrid>>;
@@ -297,7 +511,7 @@ public:
   /// @brief posToCoord is used to convert real coordinates to CoordT indexes.
   [[nodiscard]] CoordT posToCoord(const Point3D& pos)
   {
-    return posToCoord(pos.x, pos.y, pos.z);
+    return posToCoord(pos.x(), pos.y(), pos.z());
   }
 
   /// @brief coordToPos converts CoordT indexes to Point3D.
@@ -398,25 +612,22 @@ public:
 //----------------- Implementations ------------------
 //----------------------------------------------------
 
-inline Point3D::Point3D(double _x, double _y, double _z)
-  : x(_x)
-  , y(_y)
-  , z(_z)
-{}
+inline Point3D::Point3D(double _x, double _y, double _z) 
+{
+  coordinates[0] = _x;
+  coordinates[1] = _y;
+  coordinates[2] = _z;
+}
 
 inline double& Point3D::operator[](size_t index)
 {
-  switch (index)
+  // index can not be smaller than 0 (because size_t is unsigned)
+  if (index > 2) 
   {
-    case 0:
-      return x;
-    case 1:
-      return y;
-    case 2:
-      return z;
-    default:
-      throw std::runtime_error("out of bound index");
+    throw std::runtime_error("out of bound index");
   }
+
+  return coordinates[index];
 }
 
 // clang-format off
@@ -475,22 +686,18 @@ inline PointOut ConvertPoint(const PointIn& v)
 
 inline int32_t& CoordT::operator[](size_t index)
 {
-  switch (index)
+  // index can not be < 0 no need to check
+  if (index > 2) 
   {
-    case 0:
-      return x;
-    case 1:
-      return y;
-    case 2:
-      return z;
-    default:
       throw std::runtime_error("out of bound index");
   }
+
+  return coordinates[index];
 }
 
 inline bool CoordT::operator==(const CoordT& other) const
 {
-  return x == other.x && y == other.y && z == other.z;
+  return x() == other.x() && y() == other.y() && z() == other.z();
 }
 
 inline bool CoordT::operator!=(const CoordT& other) const
@@ -500,27 +707,27 @@ inline bool CoordT::operator!=(const CoordT& other) const
 
 inline CoordT CoordT::operator+(const CoordT& other) const
 {
-  return { x + other.x, y + other.y, z + other.z };
+  return { x() + other.x(), y() + other.y(), z() + other.z() };
 }
 
 inline CoordT CoordT::operator-(const CoordT& other) const
 {
-  return { x - other.x, y - other.y, z - other.z };
+  return { x() - other.x(), y() - other.y(), z() - other.z() };
 }
 
 inline CoordT& CoordT::operator+=(const CoordT& other)
 {
-  x += other.x;
-  y += other.y;
-  z += other.z;
+  coordinates[X_COORD] += other.x();
+  coordinates[Y_COORD] += other.y();
+  coordinates[Z_COORD] += other.z();
   return *this;
 }
 
 inline CoordT& CoordT::operator-=(const CoordT& other)
 {
-  x -= other.x;
-  y -= other.y;
-  z -= other.z;
+  coordinates[X_COORD] -= other.x();
+  coordinates[Y_COORD] -= other.y();
+  coordinates[Z_COORD] -= other.z();
   return *this;
 }
 
@@ -559,8 +766,8 @@ inline size_t Grid<DataT>::memUsage() const
          sizeof(DataT) * size_;
 }
 
-template <typename DataT>
-inline VoxelGrid<DataT>::VoxelGrid(double voxel_size,
+template <typename DataT, class GridAllocator>
+inline VoxelGrid<DataT, GridAllocator>::VoxelGrid(double voxel_size,
                                    uint8_t inner_bits,
                                    uint8_t leaf_bits)
   : INNER_BITS(inner_bits)
@@ -570,6 +777,7 @@ inline VoxelGrid<DataT>::VoxelGrid(double voxel_size,
   , inv_resolution(1.0 / resolution)
   , INNER_MASK((1 << INNER_BITS) - 1)
   , LEAF_MASK((1 << LEAF_BITS) - 1)
+  , gallocator(GridGeneralAllocator<DataT>())
 {
   if (LEAF_BITS < 1 || INNER_BITS < 1)
   {
@@ -578,58 +786,58 @@ inline VoxelGrid<DataT>::VoxelGrid(double voxel_size,
   }
 }
 
-template <typename DataT>
-inline CoordT VoxelGrid<DataT>::posToCoord(double x, double y, double z)
+template <typename DataT, class GridAllocator>
+inline CoordT VoxelGrid<DataT, GridAllocator>::posToCoord(double x, double y, double z)
 {
   return { static_cast<int32_t>(x * inv_resolution - std::signbit(x)),
            static_cast<int32_t>(y * inv_resolution - std::signbit(y)),
            static_cast<int32_t>(z * inv_resolution - std::signbit(z)) };
 }
 
-template <typename DataT>
-inline Point3D VoxelGrid<DataT>::coordToPos(const CoordT& coord)
+template <typename DataT, class GridAllocator>
+inline Point3D VoxelGrid<DataT, GridAllocator>::coordToPos(const CoordT& coord)
 {
-  return { (double(coord.x) + 0.5) * resolution,
-           (double(coord.y) + 0.5) * resolution,
-           (double(coord.z) + 0.5) * resolution };
+  return { (double(coord.x()) + 0.5) * resolution,
+           (double(coord.y()) + 0.5) * resolution,
+           (double(coord.z()) + 0.5) * resolution };
 }
 
-template <typename DataT>
-inline CoordT VoxelGrid<DataT>::getRootKey(const CoordT& coord)
+template <typename DataT, class GridAllocator>
+inline CoordT VoxelGrid<DataT, GridAllocator>::getRootKey(const CoordT& coord)
 {
   const int32_t MASK = ~((1 << Log2N) - 1);
-  return { coord.x & MASK, coord.y & MASK, coord.z & MASK };
+  return { coord.x() & MASK, coord.y() & MASK, coord.z() & MASK };
 }
 
-template <typename DataT>
-inline CoordT VoxelGrid<DataT>::getInnerKey(const CoordT& coord)
+template <typename DataT, class GridAllocator>
+inline CoordT VoxelGrid<DataT, GridAllocator>::getInnerKey(const CoordT& coord)
 {
   const int32_t MASK = ~((1 << LEAF_BITS) - 1);
-  return { coord.x & MASK, coord.y & MASK, coord.z & MASK };
+  return { coord.x() & MASK, coord.y() & MASK, coord.z() & MASK };
 }
 
-template <typename DataT>
-inline uint32_t VoxelGrid<DataT>::getInnerIndex(const CoordT& coord)
+template <typename DataT, class GridAllocator>
+inline uint32_t VoxelGrid<DataT, GridAllocator>::getInnerIndex(const CoordT& coord)
 {
   // clang-format off
-  return ((coord.x >> LEAF_BITS) & INNER_MASK) |
-         (((coord.y >> LEAF_BITS) & INNER_MASK) << INNER_BITS) |
-         (((coord.z >> LEAF_BITS) & INNER_MASK) << (INNER_BITS * 2));
+  return ((coord.x() >> LEAF_BITS) & INNER_MASK) |
+         (((coord.y() >> LEAF_BITS) & INNER_MASK) << INNER_BITS) |
+         (((coord.z() >> LEAF_BITS) & INNER_MASK) << (INNER_BITS * 2));
   // clang-format on
 }
 
-template <typename DataT>
-inline uint32_t VoxelGrid<DataT>::getLeafIndex(const CoordT& coord)
+template <typename DataT, class GridAllocator>
+inline uint32_t VoxelGrid<DataT, GridAllocator>::getLeafIndex(const CoordT& coord)
 {
   // clang-format off
-  return (coord.x & LEAF_MASK) |
-         ((coord.y & LEAF_MASK) << LEAF_BITS) |
-         ((coord.z & LEAF_MASK) << (LEAF_BITS * 2));
+  return (coord.x() & LEAF_MASK) |
+         ((coord.y() & LEAF_MASK) << LEAF_BITS) |
+         ((coord.z() & LEAF_MASK) << (LEAF_BITS * 2));
   // clang-format on
 }
 
-template <typename DataT>
-inline bool VoxelGrid<DataT>::Accessor::setValue(const CoordT& coord,
+template <typename DataT, class GridAllocator>
+inline bool VoxelGrid<DataT, GridAllocator>::Accessor::setValue(const CoordT& coord,
                                                  const DataT& value)
 {
   const CoordT inner_key = grid_.getInnerKey(coord);
@@ -1145,7 +1353,7 @@ struct hash<Bonxai::CoordT>
   std::size_t operator()(const Bonxai::CoordT& p) const
   {
     // same a OpenVDB
-    return ((1 << 20) - 1) & (p.x * 73856093 ^ p.y * 19349663 ^ p.z * 83492791);
+    return ((1 << 20) - 1) & (p.x() * 73856093 ^ p.y() * 19349663 ^ p.z() * 83492791);
   }
 };
 }  // namespace std
