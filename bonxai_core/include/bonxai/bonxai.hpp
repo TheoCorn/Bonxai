@@ -256,15 +256,16 @@ private:
 
   Bonxai::Mask mask_;
 
+  
+
 public:
   DataT* data_ = nullptr;
-  Grid(size_t log2dim, GridAllocator<DataT>& gallocator)
+  Grid(size_t log2dim, GridAllocator<DataT>* gallocator)
     : dim_(1 << log2dim)
     , size_(dim_ * dim_ * dim_)
     , mask_(log2dim)
   {
     data_ = gallocator.gridMalloc(size_);
-    // data_ = new DataT[size_];
   }
 
   Grid(const Grid& other) = delete;
@@ -755,7 +756,7 @@ inline Grid<DataT>::~Grid()
 {
   if (data_)
   {
-    delete[] data_;
+    
   }
 }
 
